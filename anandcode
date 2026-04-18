@@ -1,0 +1,213 @@
+const axios = require('axios');
+const escpos = require('escpos');
+escpos.Network = require('escpos-network');
+
+// ================= PRINTER CONFIG =================
+const printers = {
+    kitchen: { ip: "192.168.1.205", port: 9100 }
+};
+
+// ================= API =================
+const GET_URL = "https://exampleAI.com/VarsityKitchen/api/print_kotapi";
+const UPDATE_URL = "https://exampleAI.com/VarsityKitchen/api/insertkotprint";
+const ITEM_API_BASE = "https://exampleAI.com/VarsityKitchen/billing/kotapi/";
+
+// ================= SETTINGS =================
+const WIDTH = 32;
+let isPrinting = false;
+
+// ================= CATEGORY =================
+function getCategory(name) {
+    name = name.toLowerCase();
+    if (name.includes("beer") || name.includes("whisky") || name.includes("drink")) return "bar";
+    if (name.includes("ice cream") || name.includes("dessert")) return "counter";
+    return "kitchen";
+}
+
+// ================= ALIGN LEFT-RIGHT =================
+function formatLR(left, right, width = WIDTH) {
+    left = left || '';
+    right = right || '';
+    const spaces = width - (left.length + right.length);
+    return left + ' '.repeat(spaces > 0 ? spaces : 1) + right;
+}
+
+// ================= PRINT ITEM (AUTO WRAP + ALIGN) =================
+function printItem(printer, name, qty) {
+
+    const qtyStr = String(qty);
+    const totalWidth = WIDTH;
+    const qtyWidth = 4; // reserved space for qty
+    const nameWidth = totalWidth - qtyWidth;
+
+    let words = name.split(' ');
+    let lines = [];
+    let line = '';
+
+    // WORD WRAP
+    words.forEach(word => {
+        if ((line + ' ' + word).trim().length <= nameWidth) {
+            line += (line ? ' ' : '') + word;
+        } else {
+            lines.push(line);
+            line = word;
+        }
+    });
+
+    if (line) lines.push(line);
+
+    // PRINT
+    lines.forEach((l, i) => {
+        if (i === lines.length - 1) {
+            printer.text(
+                l.padEnd(nameWidth, ' ') + qtyStr.padStart(qtyWidth)
+            );
+        } else {
+            printer.text(l);
+        }
+    });
+}
+
+// ================= MAIN PRINT =================
+function printToPrinter(type, order) {
+
+    if (!printers[type]) {
+        console.log(`❌ No printer config for ${type}`);
+        return;
+    }
+
+    const device = new escpos.Network(printers[type].ip, printers[type].port);
+    const printer = new escpos.Printer(device);
+
+    device.open((err) => {
+
+        if (err) {
+            console.log("❌ Printer connection error:", err.message);
+            return;
+        }
+
+        try {
+
+            // RESET PRINTER
+            printer.raw(Buffer.from([0x1B, 0x40]));
+
+            const line = '-'.repeat(WIDTH);
+
+            // ===== HEADER =====
+            printer.align('CT');
+            printer.style('NORMAL');
+            printer.size(1, 1);
+            printer.text(`KOT - ORDER NO:${order.order_no}`);
+
+            printer.text(line);
+
+            // ===== ORDER INFO =====
+            printer.align('LT');
+            printer.text(formatLR(`Waiter: ${order.waiter}`, `Table: ${order.table}`));
+            printer.text(formatLR(`Date: ${order.date}`, `Time: ${order.time}`));
+
+            printer.text(line);
+
+            // ===== COLUMN HEADER =====
+            printer.text(formatLR('Item', 'Qty'));
+            printer.text(line);
+
+            // ===== ITEMS =====
+            let totalItem = 0;
+            let totalQty = 0;
+
+            order.items.forEach(item => {
+                if (item.category === type) {
+                    totalItem++;
+                    totalQty += Number(item.qty);
+                    printItem(printer, item.name, item.qty);
+                }
+            });
+
+            printer.text(line);
+
+            // ===== TOTAL =====
+            printer.text(formatLR(`Items: ${totalItem}`, `Qty: ${totalQty}`));
+            printer.text(line);
+
+            // ===== NOTE =====
+            printer.text("Special Instructions:");
+            printer.text(order.instructions || "-");
+
+            printer.feed(2);
+            printer.cut();
+            printer.close();
+
+            console.log(`✅ Printed (${type})`);
+
+        } catch (e) {
+            console.log("❌ Print error:", e.message);
+        }
+    });
+}
+
+// ================= AUTO PRINT =================
+async function autoPrint() {
+
+    if (isPrinting) return;
+    isPrinting = true;
+
+    try {
+
+        const res = await axios.get(GET_URL);
+
+        if (!res.data || res.data.status === false) {
+            isPrinting = false;
+            return;
+        }
+
+        const { order_id, session_id } = res.data;
+
+
+        const itemRes = await axios.get(ITEM_API_BASE + session_id);
+        const itemData = itemRes.data;
+
+        const isCounter = !itemData.waiterandtable || itemData.waiterandtable === false;
+
+        const order = {
+            order_no: order_id,
+            date: new Date().toLocaleDateString(),
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            waiter: isCounter ? "Counter" : itemData.waiterandtable.fullname,
+            table: isCounter ? "Takeaway" : itemData.waiterandtable.tables_number,
+            instructions: itemData.orderidspecialinstruction?.order_spinstruction || "-",
+            items: []
+        };
+
+        itemData.kotitems.forEach(item => {
+            order.items.push({
+                name: item.product_title,
+                qty: item.order_items_qty,
+                category: getCategory(item.product_title)
+            });
+        });
+
+        // ===== PRINT =====
+        ["kitchen"].forEach(type => {
+            if (order.items.some(i => i.category === type)) {
+                printToPrinter(type, order);
+            }
+        });
+
+        // ===== UPDATE STATUS =====
+        await axios.post(UPDATE_URL, {
+            order_id,
+            print_status: 1
+        });
+
+        console.log("✅ Status Updated");
+
+    } catch (err) {
+        console.log("❌ Error:", err.message);
+    }
+
+    isPrinting = false;
+}
+
+// ================= LOOP =================
+setInterval(autoPrint, 5000);
